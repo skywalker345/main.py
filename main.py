@@ -24,7 +24,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 # ---------- ENV ----------
 DB_PATH = os.getenv("DB_PATH", "alpha_bot.db")
-TOKEN = os.getenv("TELEGRAM_TOKEN")
+TOKEN = os.getenv("7813840039:AAFquVUm1z_IXM60VJwWqftocUCFYGhHRYI")
 if not TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is required")
 
