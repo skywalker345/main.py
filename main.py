@@ -609,56 +609,65 @@ class TelegramBotAdapter:
 def main():
     print("🤖 AlphaTrackerBot v1.0\n")
     
-    # Проверяем токен
+    # Проверяем токен и окружение
+    is_render = os.getenv("RENDER") == "true"
+    
     if BOT_TOKEN == "7813840039:AAFquVUm1z_IXM60VJwWqftocUCFYGhHRYI":
-        print("⚠️  Токен Telegram не установлен!")
-        print("   Выбери режим:\n")
-        print("   1) CLI режим (консоль)")
-        print("   2) Telegram режим (нужен токен)\n")
-        
-        choice = input("Выбор (1 или 2): ").strip()
-        
-        if choice == "2":
-            print("\n📌 Для Telegram режима:\n")
-            print("   a) Получи токен у @BotFather в Telegram")
-            print("   b) Задай переменную окружения:")
-            print("      export BOT_TOKEN='твой_токен_здесь'")
-            print("   c) Или отредактируй строку 362 в коде:")
-            print("      BOT_TOKEN = 'твой_токен_здесь'\n")
-            return
-        
-        choice = "1"
-    else:
-        choice = input("CLI (1) или Telegram (2)? [1]: ").strip() or "1"
+        print("❌ Ошибка: токен Telegram не установлен!")
+        print("\n📌 Инструкция для Render:")
+        print("   1. Перейди в Dashboard → Environment")
+        print("   2. Добавь переменную: BOT_TOKEN = твой_токен_от_BotFather")
+        print("   3. Перезапусти сервис\n")
+        print("📌 Для локального запуска:")
+        print("   export BOT_TOKEN='123456:ABCDEFghijklmnop'")
+        print("   python3 alpha_tracker_bot.py\n")
+        return
 
-    if choice == "2":
-        # Telegram режим
+    # На Render/серверах запускаем только Telegram режим (без input)
+    if is_render:
+        print("🚀 Запуск на Render (Telegram режим)\n")
         tg_bot = TelegramBotAdapter(BOT_TOKEN)
         if tg_bot.is_connected:
             tg_bot.setup_handlers()
             tg_bot.start_polling()
     else:
-        # CLI режим
-        bot = AlphaTrackerBot()
-        print("🤖 AlphaTrackerBot запущен (CLI режим)")
-        print("Введи команду или /start для справки. /exit для выхода.\n")
+        # Локально: спрашиваем режим
+        try:
+            choice = input("CLI (1) или Telegram (2)? [1]: ").strip() or "1"
+        except EOFError:
+            # Если input недоступен (например, в некоторых окружениях), используем Telegram
+            print("⚠️  Интерактивный ввод недоступен, переходим на Telegram режим...")
+            choice = "2"
 
-        while True:
-            try:
-                user_input = input(">>> ").strip()
-                if user_input.lower() == "/exit":
-                    print("👋 До свидания!")
+        if choice == "2":
+            # Telegram режим
+            tg_bot = TelegramBotAdapter(BOT_TOKEN)
+            if tg_bot.is_connected:
+                tg_bot.setup_handlers()
+                tg_bot.start_polling()
+        else:
+            # CLI режим
+            bot = AlphaTrackerBot()
+            print("🤖 AlphaTrackerBot запущен (CLI режим)")
+            print("Введи команду или /start для справки. /exit для выхода.\n")
+
+            while True:
+                try:
+                    user_input = input(">>> ").strip()
+                    if user_input.lower() == "/exit":
+                        print("👋 До свидания!")
+                        break
+                    if not user_input:
+                        continue
+
+                    response = bot.handle_command(user_input)
+                    print(f"\n{response}\n")
+                except KeyboardInterrupt:
+                    print("\n👋 Выход...")
                     break
-                if not user_input:
-                    continue
-
-                response = bot.handle_command(user_input)
-                print(f"\n{response}\n")
-            except KeyboardInterrupt:
-                print("\n👋 Выход...")
-                break
-            except Exception as e:
-                print(f"❌ Ошибка: {e}\n")
+                except Exception as e:
+                    print(f"❌ Ошибка: {e}\n")
 
 
-
+if __name__ == "__main__":
+    main()
