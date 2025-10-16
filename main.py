@@ -1,556 +1,665 @@
-# -*- coding: utf-8 -*-
-# Alpha Drop Bot v2.5 — Railway
-# Новое в v2.5:
-# (4) Автоподтверждение за 1 час до старта, если нет броней → авто-назначаем топ-1 (с кнопкой отмены)
-# (6) Самообучение: динамический trust_score (+/-) на основе фактических исходов и прогнозов
-# (7) Кастомные напоминания: /newdrop ... remind=6,3,1 (часы до старта). По умолчанию: 10:00, -4/-3/-2/-1, старт
-#
-# Основа (из v2.4): модель Alpha (скользящее окно 15 дней), прогноз к дате, мультибронь (топ-3),
-# «забрал/не получилось», пост-резюме+архив, статистика, бэкап, меню, /forecast, /mystatus и т.д.
+#!/usr/bin/env python3
+"""
+AlphaTrackerBot — управление дропами и командной работой
+"""
 
-import os, re, json, sqlite3, time, io, logging
-from datetime import datetime, timedelta, date
-from dateutil import parser as duparser
-import pytz
+import sqlite3
+import json
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from typing import List, Dict, Optional, Tuple
+import re
 
-import telebot
-from telebot.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
-    ReplyKeyboardMarkup, KeyboardButton, BotCommand, InputFile
-)
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.date import DateTrigger
-from apscheduler.triggers.cron import CronTrigger
+# ============================================================================
+# КОНФИГУРАЦИЯ
+# ============================================================================
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+TZ = ZoneInfo("Europe/Kyiv")
+WORK_START = 11
+WORK_END = 23
+DAILY_FEE_USD = 2.5
 
-# ---------- ENV ----------
-DB_PATH = os.getenv("DB_PATH", "alpha_bot.db")
-TOKEN = os.getenv("7813840039:AAFquVUm1z_IXM60VJwWqftocUCFYGhHRYI")
+COMMISSIONED_MEMBERS = {
+    "Назар": 0.2,
+    "releZz": 0.2,
+    "Ангелина 19": 0.2,
+    "Ваня": 0.0,
+}
 
-DEFAULT_TZ = os.getenv("TZ_KYIV", "Europe/Kyiv")
-KYIV_TZ = pytz.timezone(DEFAULT_TZ)
+KNOWN_PARTICIPANTS = [
+    "Назар", "releZz", "Ангелина 19", "Ваня", 
+    "Андрей", "Ярик", "Серёга"
+]
 
-GLOBAL_CHAT_ID = os.getenv("CHAT_ID")
-GLOBAL_THREAD_ID = os.getenv("THREAD_ID")
-if GLOBAL_THREAD_ID:
-    try: GLOBAL_THREAD_ID = int(GLOBAL_THREAD_ID)
-    except: GLOBAL_THREAD_ID = None
+# ============================================================================
+# БАЗА ДАННЫХ
+# ============================================================================
 
-bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
-scheduler = BackgroundScheduler(timezone=KYIV_TZ); scheduler.start()
+class Database:
+    def __init__(self, db_path="drops.db"):
+        self.db_path = db_path
+        self.init_db()
 
-# ---------- DB ----------
-def db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+    def get_conn(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
 
-def init_db():
-    conn = db(); cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS config(
-        key TEXT PRIMARY KEY, value TEXT
-    );""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS users(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tg_id INTEGER UNIQUE,
-        username TEXT, first_name TEXT, last_name TEXT,
-        rate_active INTEGER DEFAULT 17,        -- 17/18 ap/day
-        daily_window TEXT,                     -- JSON: ≤15 вкладов по дням
-        points INTEGER DEFAULT 0,              -- кэш суммы окна
-        last_window_date TEXT,                 -- дата последнего слота
-        last_pickup TEXT,                      -- последний «забрал»
-        last_update TEXT,                      -- последняя ручная активность
-        trust_score INTEGER DEFAULT 80,        -- 0..100
-        taken_count INTEGER DEFAULT 0,
-        fail_count INTEGER DEFAULT 0,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS drops(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts_kyiv TEXT NOT NULL,
-        points_required INTEGER NOT NULL,
-        chat_id TEXT, thread_id INTEGER, created_by INTEGER,
-        status TEXT DEFAULT 'scheduled',       -- scheduled/finished/cancelled
-        note TEXT,
-        reserved_by TEXT,                      -- JSON [tg_id,...]
-        picked_by TEXT,                        -- JSON [tg_id,...]
-        failed_by TEXT,                        -- JSON [tg_id,...]
-        max_reserves INTEGER DEFAULT 3,
-        summary_posted INTEGER DEFAULT 0,
-        remind_plan TEXT,                      -- JSON [6,3,1] (часы до старта), None → дефолт
-        predicted_at_create TEXT,              -- JSON {tg_id:pred} снимок прогнозов на момент создания
-        predicted_at_minus1h TEXT              -- JSON {tg_id:pred} снимок прогнозов за 1 час (для самообучения)
-    );""")
-    conn.commit(); conn.close()
-init_db()
+    def init_db(self):
+        conn = self.get_conn()
+        c = conn.cursor()
 
-# ---------- HELPERS ----------
-def ns(s): return re.sub(r"\s+", " ", s or "").strip()
-def jloads(s, default):
-    try: return json.loads(s) if s else default
-    except: return default
-def jdump(obj): return json.dumps(obj, ensure_ascii=False)
-def now_kyiv(): return datetime.now(KYIV_TZ)
-def human_dt(dt: datetime): return dt.strftime("%d.%m.%Y %H:%M")
-def human_date(d: date): return d.strftime("%d.%m.%Y")
+        # Члены команды
+        c.execute("""CREATE TABLE IF NOT EXISTS members (
+            name TEXT PRIMARY KEY,
+            ap INTEGER DEFAULT 0,
+            refund_days TEXT DEFAULT '[]',
+            last_gap_days TEXT DEFAULT '[0,0]',
+            updated_at TEXT
+        )""")
 
-def set_config(key, value):
-    conn = db()
-    conn.execute("INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,value))
-    conn.commit(); conn.close()
+        # События (дропы)
+        c.execute("""CREATE TABLE IF NOT EXISTS drop_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            when_ts INTEGER NOT NULL,
+            ap_threshold INTEGER,
+            symbol TEXT,
+            status TEXT DEFAULT 'planned',
+            created_at TEXT
+        )""")
 
-def get_config(key):
-    conn=db(); row=conn.execute("SELECT value FROM config WHERE key=?", (key,)).fetchone(); conn.close()
-    return row["value"] if row else None
+        # Рекомендации
+        c.execute("""CREATE TABLE IF NOT EXISTS recommendations (
+            event_id INTEGER,
+            member_name TEXT,
+            score INTEGER,
+            signals TEXT,
+            rank INTEGER,
+            PRIMARY KEY (event_id, member_name)
+        )""")
 
-def get_config_int(key):
-    v = get_config(key)
-    try: return int(v) if v is not None else None
-    except: return None
+        # Бронирования
+        c.execute("""CREATE TABLE IF NOT EXISTS reservations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER,
+            member_name TEXT,
+            status TEXT DEFAULT 'requested',
+            timestamp TEXT
+        )""")
 
-def ensure_chat_thread(m: Message):
-    chat_id = GLOBAL_CHAT_ID or str(m.chat.id)
-    thread_id = GLOBAL_THREAD_ID
-    if getattr(m, "message_thread_id", None): thread_id = m.message_thread_id
-    c = get_config("CHAT_ID"); t = get_config("THREAD_ID")
-    if c: chat_id = c
-    if t:
-        try: thread_id = int(t)
-        except ValueError: thread_id = None
-    return chat_id, thread_id
+        # Отчёты о продажах
+        c.execute("""CREATE TABLE IF NOT EXISTS trade_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER,
+            member_name TEXT,
+            asset TEXT,
+            qty REAL,
+            sell_price REAL,
+            gross_usd REAL,
+            fees_usd REAL,
+            net_usd REAL,
+            share_model REAL,
+            created_at TEXT
+        )""")
 
-def send(chat_id, text, thread_id=None, reply_markup=None):
-    try:
-        return bot.send_message(chat_id, text,
-            message_thread_id=thread_id if thread_id else None,
-            disable_web_page_preview=True, reply_markup=reply_markup)
-    except Exception as e:
-        logger.error(f"Send error: {e}"); return None
-
-def parse_points(txt: str):
-    m = re.search(r"(\d{1,5})\s*(ap|ап|points?)?\b", txt, re.IGNORECASE)
-    return int(m.group(1)) if m else None
-
-def parse_rate(txt: str):
-    m = re.search(r"(rate|рейт|скорость)\s*(\d{1,3})\b", txt, re.IGNORECASE)
-    if m:
-        v = int(m.group(2)); return max(0, min(50, v))
-    return None
-
-def parse_date_str(txt: str):
-    for pat in [r"\b(\d{4}-\d{2}-\d{2})\b", r"\b(\d{2}\.\d{2}\.\d{4})\b", r"\b(\d{2}/\d{2}/\d{4})\b"]:
-        m = re.search(pat, txt)
-        if m:
-            raw = m.group(1)
-            try:
-                if "-" in raw: return datetime.strptime(raw, "%Y-%m-%d").date()
-                if "." in raw: return datetime.strptime(raw, "%d.%m.%Y").date()
-                return datetime.strptime(raw, "%d/%m/%Y").date()
-            except: pass
-    if re.search(r"сегодня", txt, re.IGNORECASE): return now_kyiv().date()
-    if re.search(r"вчера", txt, re.IGNORECASE): return (now_kyiv() - timedelta(days=1)).date()
-    m = re.search(r"(\d{1,2})\s*(дн|дня|дней)\s*назад", txt, re.IGNORECASE)
-    if m: return (now_kyiv() - timedelta(days=int(m.group(1)))).date()
-    return None
-
-def parse_drop_datetime(text: str):
-    t = ns(text)
-    pts = None
-    remind_plan = None
-    r = re.search(r"remind=([0-9,\s]+)", t, re.IGNORECASE)
-    if r:
-        remind_plan = [int(x) for x in re.findall(r"\d+", r.group(1))]
-        t = (t[:r.start()] + t[r.end():]).strip()
-
-    pts_m = re.search(r"(\d{2,5})\s*(ap|ап|балл|баллов|points?)?\s*$", t, re.IGNORECASE)
-    if pts_m:
-        try: pts = int(pts_m.group(1)); t = t[:pts_m.start()]
-        except: pass
-    base = now_kyiv()
-    try:
-        dt = duparser.parse(t, dayfirst=True, default=base.replace(hour=0, minute=0, second=0, microsecond=0))
-        dt = dt if dt.tzinfo else KYIV_TZ.localize(dt)
-        if dt < base and not re.search(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}-\d{2}-\d{2}", t):
-            dt = dt + timedelta(days=1)
-        if (dt.date() - base.date()).days < -7:
-            return None, None, None
-    except Exception as e:
-        logger.error(f"parse_drop_datetime error: {e}")
-        return None, None, None
-    return dt, pts, remind_plan
-
-# ---------- WINDOW / POINTS ----------
-MAX_WIN = 15
-
-def _sum_window(win): 
-    return sum([int(x) for x in (win or [])])
-
-def _load_user(tg_id):
-    conn=db()
-    u=conn.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,)).fetchone()
-    conn.close()
-    return u
-
-def _save_user_window_and_points(tg_id, win, today=None):
-    win = (win or [])[-MAX_WIN:]
-    pts = _sum_window(win)
-    conn=db()
-    conn.execute("UPDATE users SET daily_window=?, points=?, last_window_date=?, updated_at=CURRENT_TIMESTAMP WHERE tg_id=?",
-                 (jdump(win), pts, (today or now_kyiv().date().isoformat()), tg_id))
-    conn.commit(); conn.close()
-    return pts
-
-def _ensure_today_slot(urow):
-    today = now_kyiv().date()
-    last_date = urow["last_window_date"]
-    win = jloads(urow["daily_window"], [])
-    rate = urow["rate_active"] or 17
-
-    if not win and (urow["points"] or 0) > 0:
-        approx = [rate]*MAX_WIN
-        need = urow["points"] - _sum_window(approx)
-        approx[-1] = max(0, approx[-1] + need)
-        win = approx[-MAX_WIN:]
-
-    if not last_date:
-        if not win: win=[0]
-        _save_user_window_and_points(urow["tg_id"], win, today.isoformat())
-        urow = _load_user(urow["tg_id"])
-        win = jloads(urow["daily_window"], [])
-        last_date = urow["last_window_date"]
-
-    if not last_date: last_date = today.isoformat()
-    last = datetime.strptime(last_date, "%Y-%m-%d").date()
-    if last == today: return win
-
-    delta_days = (today - last).days
-    if delta_days <= 0: return win
-
-    for _ in range(delta_days):
-        if len(win) >= MAX_WIN: win.pop(0)
-        win.append(rate)
-    _save_user_window_and_points(urow["tg_id"], win, today.isoformat())
-    return win
-
-def _apply_today_take(win):
-    if not win: return [0]
-    win = win[:]
-    win[-1] = 0
-    return win
-
-def _model_future_points(win, rate, days_ahead):
-    sim = list((win or [])[-MAX_WIN:])
-    for _ in range(days_ahead):
-        if len(sim) >= MAX_WIN: sim.pop(0)
-        sim.append(rate)
-    return _sum_window(sim)
-
-# ---------- USERS ----------
-def upsert_user_profile(user, text: str):
-    points = parse_points(text)
-    rate = parse_rate(text)
-    last_pick = parse_date_str(text)
-
-    conn = db()
-    row = conn.execute("SELECT * FROM users WHERE tg_id=?", (user.id,)).fetchone()
-    username = user.username or ""; fn = user.first_name or ""; ln = user.last_name or ""
-    today = now_kyiv().date().isoformat()
-
-    if row:
-        new_rate = rate if rate is not None else (row["rate_active"] or 17)
-        new_last_pick = (last_pick.isoformat() if last_pick else row["last_pickup"])
-        win = jloads(row["daily_window"], [])
-        if points is not None:
-            approx = [new_rate]*MAX_WIN
-            need = points - _sum_window(approx)
-            approx[-1] = max(0, approx[-1] + need)
-            win = approx[-MAX_WIN:]
-            pts = _sum_window(win)
-            conn.execute("""UPDATE users SET username=?, first_name=?, last_name=?,
-                            rate_active=?, daily_window=?, points=?, last_window_date=?,
-                            last_pickup=?, last_update=?, updated_at=CURRENT_TIMESTAMP
-                            WHERE tg_id=?""",
-                         (username, fn, ln, new_rate, jdump(win), pts, today,
-                          new_last_pick, today, user.id))
-        else:
-            conn.execute("""UPDATE users SET username=?, first_name=?, last_name=?,
-                            rate_active=?, last_pickup=?, last_update=?, updated_at=CURRENT_TIMESTAMP
-                            WHERE tg_id=?""",
-                         (username, fn, ln, new_rate, new_last_pick, today, user.id))
-    else:
-        init_rate = rate if rate is not None else 17
-        win=[]; pts=0
-        if points is not None:
-            approx=[init_rate]*MAX_WIN
-            need = points - _sum_window(approx)
-            approx[-1] = max(0, approx[-1] + need)
-            win = approx[-MAX_WIN:]; pts = _sum_window(win)
-        conn.execute("""INSERT INTO users(tg_id, username, first_name, last_name,
-                        rate_active, daily_window, points, last_window_date, last_pickup, last_update)
-                        VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                     (user.id, username, fn, ln, init_rate, jdump(win), pts, today,
-                      last_pick.isoformat() if last_pick else None, today))
-    conn.commit(); conn.close()
-
-def format_user_tag(urow):
-    if not urow: return "—"
-    return f"@{urow['username']}" if urow["username"] else f"id:{urow['tg_id']}"
-
-# ---------- Прогноз / скоринг / выбор ----------
-def predicted_points_to_date(urow, drop_dt: datetime):
-    rate = urow["rate_active"] or 17
-    win = _ensure_today_slot(urow)
-    days = max(0, (drop_dt.date() - now_kyiv().date()).days)
-    return _model_future_points(win, rate, days)
-
-def choose_best(points_required: int, drop_dt: datetime, top_k=4):
-    conn=db()
-    users=conn.execute("SELECT * FROM users").fetchall()
-    conn.close()
-    scored=[]
-    for u in users:
-        pred = predicted_points_to_date(u, drop_dt)
-        eligible = pred >= points_required
-        score = (1000 if eligible else 0) + max(0, pred - points_required)
-        if u["last_pickup"]:
-            try: days_since=(now_kyiv().date()-datetime.strptime(u["last_pickup"],"%Y-%m-%d").date()).days
-            except: days_since=0
-            score += days_since*5
-        else:
-            score += 30
-        score += int((u["trust_score"] or 80)/5)
-        scored.append((u, eligible, pred, score))
-    scored.sort(key=lambda x: (x[1], x[3]), reverse=True)
-    return scored[:top_k]
-
-# ---------- Самообучение ----------
-def adjust_trust(tg_id: int, delta: int, reason: str):
-    conn=db()
-    u=conn.execute("SELECT trust_score FROM users WHERE tg_id=?", (tg_id,)).fetchone()
-    if not u: conn.close(); return
-    new = max(0, min(100, int((u["trust_score"] or 80) + delta)))
-    conn.execute("UPDATE users SET trust_score=?, updated_at=CURRENT_TIMESTAMP WHERE tg_id=?", (new, tg_id))
-    conn.commit(); conn.close()
-    logger.info(f"[TRUST] {tg_id} {('+' if delta>=0 else '')}{delta} — {reason}")
-
-# ---------- Напоминания / авто-подтверждение ----------
-def schedule_reminders(drop_id: int, when_dt: datetime, chat_id: str, thread_id: int, pts_required: int, remind_plan=None):
-    def add_job(dt, label, fn= None, args=None, job_id=None):
-        scheduler.add_job(
-            fn if fn else notify_drop,
-            trigger=DateTrigger(run_date=dt),
-            args=args if args is not None else [drop_id, chat_id, thread_id, pts_required, label],
-            id=job_id or f"drop_{drop_id}_{label}_{int(dt.timestamp())}",
-            replace_existing=True
-        )
-    now = now_kyiv()
-
-    used_hours = set()
-    if remind_plan:
-        for h in sorted(set(int(x) for x in remind_plan if int(x)>=1), reverse=True):
-            t = when_dt - timedelta(hours=h)
-            if t > now:
-                add_job(t, f"minus{h}h")
-                used_hours.add(h)
-
-    default_hours = [4,3,2,1]
-    for h in default_hours:
-        if h in used_hours: continue
-        t = when_dt - timedelta(hours=h)
-        if t > now:
-            add_job(t, f"minus{h}h")
-
-    ten = when_dt.replace(hour=10, minute=0, second=0, microsecond=0)
-    if ten > now and ten.date()==when_dt.date():
-        add_job(ten, "ten_am")
-
-    minus1 = when_dt - timedelta(hours=1)
-    if minus1 > now:
-        add_job(minus1, "autoconfirm", fn=auto_confirm_if_empty, 
-                args=[drop_id], job_id=f"drop_{drop_id}_autoconfirm")
-
-    if when_dt > now:
-        add_job(when_dt, "start")
-
-    post_sum = when_dt + timedelta(hours=4)
-    if post_sum > now:
-        add_job(post_sum, "summary", fn=post_drop_summary, args=[drop_id, chat_id, thread_id], job_id=f"drop_{drop_id}_summary")
-
-def build_reserve_markup(drop_id: int):
-    mk=InlineKeyboardMarkup()
-    mk.add(InlineKeyboardButton("Забираю ✅", callback_data=f"reserve:{drop_id}"))
-    mk.add(InlineKeyboardButton("Отменить ❌", callback_data=f"cancel:{drop_id}"))
-    return mk
-
-def snapshot_predictions(drop_id: int, lbl_field: str):
-    conn=db()
-    d=conn.execute("SELECT * FROM drops WHERE id=?", (drop_id,)).fetchone()
-    if not d: conn.close(); return
-    when_dt = datetime.fromisoformat(d["ts_kyiv"]); when_dt = when_dt if when_dt.tzinfo else KYIV_TZ.localize(when_dt)
-    pts_req = d["points_required"]
-    users = conn.execute("SELECT * FROM users").fetchall()
-    pred_map = {}
-    for u in users:
-        rate = u["rate_active"] or 17
-        days = max(0, (when_dt.date() - now_kyiv().date()).days)
-        win = jloads(u["daily_window"], [])
-        if not win and (u["points"] or 0) > 0:
-            approx=[rate]*MAX_WIN
-            need = u["points"] - _sum_window(approx)
-            approx[-1] = max(0, approx[-1] + need)
-            win=approx[-MAX_WIN:]
-        pred = _model_future_points(win, rate, days)
-        pred_map[str(u["tg_id"])] = pred
-    conn.execute(f"UPDATE drops SET {lbl_field}=? WHERE id=?", (jdump(pred_map), drop_id))
-    conn.commit(); conn.close()
-
-def notify_drop(drop_id: int, chat_id: str, thread_id: int, pts_required: int, label: str):
-    conn=db()
-    d=conn.execute("SELECT * FROM drops WHERE id=?", (drop_id,)).fetchone()
-    conn.close()
-    if not d or d["status"]!="scheduled": return
-    when_dt = datetime.fromisoformat(d["ts_kyiv"]); when_dt = when_dt if when_dt.tzinfo else KYIV_TZ.localize(when_dt)
-
-    if label == "minus1h":
-        snapshot_predictions(drop_id, "predicted_at_minus1h")
-
-    picks = choose_best(pts_required, when_dt, top_k=4)
-    lines=[]
-    header = "🔔 Напоминание по дропу" if label!="start" else "🚀 ДРОП СЕЙЧАС!"
-    lines.append(f"<b>{header}</b>\n🕒 {human_dt(when_dt)} (Киев)")
-    if label!="start":
-        diff = when_dt - now_kyiv()
-        h = int(diff.total_seconds()//3600); m = int((diff.total_seconds()%3600)//60)
-        left = "сейчас" if diff.total_seconds()<=0 else (f"через {h} ч {m} мин" if h>=1 else f"через {m} мин")
-        lines.append(f"До старта: <i>{left}</i>")
-
-    recommended=[]
-    for i,(u, elig, pred, sc) in enumerate(picks, start=1):
-        nm = format_user_tag(u)
-        recommended.append((nm, pred, elig))
-        if i==3: break
-    if recommended:
-        lines.append("\n💡 <b>Рекомендуемые (прогноз к дате):</b>")
-        for i,(nm, pred, elig) in enumerate(recommended, start=1):
-            mark = "✅" if elig else "⚠️"
-            lines.append(f"{i}️⃣ {nm} — ~{pred} ap {mark}")
-
-    rlist = jloads(d["reserved_by"], [])
-    if rlist:
-        show=[]
-        for uid in rlist:
-            u=_load_user(uid); show.append(format_user_tag(u))
-        lines.append(f"\n✅ Уже бронировали: {', '.join(show)}")
-
-    lines.append(f"\n📏 Требуется: <b>{pts_required} ap</b>")
-    send(chat_id, "\n".join(lines), thread_id=thread_id, reply_markup=build_reserve_markup(drop_id))
-
-def auto_confirm_if_empty(drop_id: int):
-    conn=db()
-    d=conn.execute("SELECT * FROM drops WHERE id=?", (drop_id,)).fetchone()
-    if not d or d["status"]!="scheduled":
-        conn.close(); return
-    when_dt = datetime.fromisoformat(d["ts_kyiv"]); when_dt = when_dt if when_dt.tzinfo else KYIV_TZ.localize(when_dt)
-    pts_req = d["points_required"]
-    reserved = jloads(d["reserved_by"], [])
-
-    if not d["predicted_at_minus1h"]:
-        snapshot_predictions(drop_id, "predicted_at_minus1h")
-
-    if reserved:
-        conn.close(); return
-
-    picks = choose_best(pts_req, when_dt, top_k=1)
-    if not picks:
-        conn.close(); return
-    top_user = picks[0][0]
-    reserved = [top_user["tg_id"]]
-    conn.execute("UPDATE drops SET reserved_by=? WHERE id=?", (jdump(reserved), drop_id))
-    conn.commit(); conn.close()
-
-    chat_id, thread_id = d["chat_id"], d["thread_id"]
-    send(chat_id,
-         f"⚡ Автоподтверждение: {format_user_tag(top_user)} назначен на дроп ID {drop_id} (за час до старта не было броней).\n"
-         f"Если не согласен — нажми «Отменить ❌».",
-         thread_id)
-
-# ---------- DAILY CRON 00:05 ----------
-def daily_tick():
-    try:
-        today = now_kyiv().date().isoformat()
-        conn=db()
-        users=conn.execute("SELECT * FROM users").fetchall()
-        for u in users:
-            rate = u["rate_active"] or 17
-            win = jloads(u["daily_window"], [])
-            if u["last_window_date"] == today:
-                continue
-            if len(win) >= MAX_WIN: win.pop(0)
-            win.append(rate)
-            pts = _sum_window(win)
-            conn.execute("""UPDATE users SET daily_window=?, points=?, last_window_date=?, 
-                            last_update=?, updated_at=CURRENT_TIMESTAMP WHERE tg_id=?""",
-                         (jdump(win), pts, today, today, u["tg_id"]))
         conn.commit()
-
-        chat_id = get_config("CHAT_ID") or GLOBAL_CHAT_ID
-        thread_id = get_config_int("THREAD_ID") or GLOBAL_THREAD_ID
-        if chat_id:
-            rows = conn.execute("SELECT * FROM users ORDER BY points DESC").fetchall()
-            lines = ["📊 Сумма по окну 15дн (ежедневный апдейт):"]
-            for u in rows:
-                lines.append(f"{format_user_tag(u)} — {u['points']} ap (rate {u['rate_active']}/д)")
-            send(chat_id, "\n".join(lines), thread_id)
-
-            stale = conn.execute("""
-                SELECT * FROM users 
-                WHERE last_update IS NULL OR julianday(date('now')) - julianday(last_update) >= 3
-            """).fetchall()
-            if stale:
-                names = ", ".join([format_user_tag(u) for u in stale[:10]])
-                send(chat_id, f"🔔 Напоминание: {names}\nОбновите профиль: /drop 250ap rate 17", thread_id)
-
         conn.close()
-    except Exception as e:
-        logger.error(f"daily_tick error: {e}")
 
-scheduler.add_job(daily_tick, trigger=CronTrigger(hour=0, minute=5))
+        # Инициализация участников
+        self.init_members()
 
-# ---------- Итоги/архив + самообучение ----------
-def post_drop_summary(drop_id:int, chat_id:str, thread_id:int):
-    conn=db()
-    d=conn.execute("SELECT * FROM drops WHERE id=?", (drop_id,)).fetchone()
-    if not d or d["summary_posted"]:
-        conn.close(); return
-
-    if d["status"]=="scheduled":
-        conn.execute("UPDATE drops SET status='finished' WHERE id=?", (drop_id,))
+    def init_members(self):
+        conn = self.get_conn()
+        c = conn.cursor()
+        for name in KNOWN_PARTICIPANTS:
+            c.execute("INSERT OR IGNORE INTO members (name, updated_at) VALUES (?, ?)",
+                     (name, self._now()))
         conn.commit()
+        conn.close()
 
-    picked = jloads(d["picked_by"], [])
-    failed = jloads(d["failed_by"], [])
-    reserved = jloads(d["reserved_by"], [])
-    pts_req = d["points_required"]
+    @staticmethod
+    def _now():
+        return datetime.now(TZ).isoformat()
 
-    pred_create = jloads(d["predicted_at_create"], {})
-    pred_minus1 = jloads(d["predicted_at_minus1h"], {})
+    def update_member(self, name: str, ap: int, refund_days: List[int], last_gap: Tuple[int, int]):
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute("""UPDATE members 
+                    SET ap=?, refund_days=?, last_gap_days=?, updated_at=? 
+                    WHERE name=?""",
+                 (ap, json.dumps(refund_days), json.dumps(list(last_gap)), self._now(), name))
+        conn.commit()
+        conn.close()
 
-    for uid in picked:
-        adjust_trust(uid, +3, "picked_success")
-        conn.execute("""UPDATE users SET taken_count=taken_count+1, last_pickup=?, 
-                        updated_at=CURRENT_TIMESTAMP WHERE tg_id=?""",
-                     (now_kyiv().date().isoformat(), uid))
-        u = _load_user(uid)
-        win = _ensure_today_slot(u)
-        win = _apply_today_take(win)
-        _save_user_window_and_points(uid, win)
+    def get_member(self, name: str) -> Optional[Dict]:
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute("SELECT * FROM members WHERE name=?", (name,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            return {
+                "name": row["name"],
+                "ap": row["ap"],
+                "refund_days": json.loads(row["refund_days"]),
+                "last_gap_days": json.loads(row["last_gap_days"]),
+                "updated_at": row["updated_at"]
+            }
+        return None
 
-    for uid in failed:
-        adjust_trust(uid, -4, "failed_drop")
-        conn.execute("UPDATE users SET fail_count=fail_count+1, updated_at=CURRENT_TIMESTAMP WHERE tg_id=?", (uid,))
+    def get_all_members(self) -> List[Dict]:
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute("SELECT * FROM members")
+        rows = c.fetchall()
+        conn.close()
+        result = []
+        for row in rows:
+            result.append({
+                "name": row["name"],
+                "ap": row["ap"],
+                "refund_days": json.loads(row["refund_days"]),
+                "last_gap_days": json.loads(row["last_gap_days"]),
+                "updated_at": row["updated_at"]
+            })
+        return result
 
-    for uid in reserved:
-        if uid not in picked:
-            adjust_trust(uid, -2, "reserved_but_not_picked")
+    def create_drop_event(self, when_ts: int, ap_threshold: int, symbol: Optional[str] = None) -> int:
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute("""INSERT INTO drop_events (when_ts, ap_threshold, symbol, created_at)
+                    VALUES (?, ?, ?, ?)""",
+                 (when_ts, ap_threshold, symbol or "", self._now()))
+        conn.commit()
+        event_id = c.lastrowid
+        conn.close()
+        return event_id
+
+    def get_drop_event(self, event_id: int) -> Optional[Dict]:
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute("SELECT * FROM drop_events WHERE id=?", (event_id,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            return {
+                "id": row["id"],
+                "when_ts": row["when_ts"],
+                "ap_threshold": row["ap_threshold"],
+                "symbol": row["symbol"],
+                "status": row["status"]
+            }
+        return None
+
+    def save_recommendations(self, event_id: int, recs: List[Tuple[str, int, str, int]]):
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute("DELETE FROM recommendations WHERE event_id=?", (event_id,))
+        for member_name, score, signals, rank in recs:
+            c.execute("""INSERT INTO recommendations 
+                        (event_id, member_name, score, signals, rank)
+                        VALUES (?, ?, ?, ?, ?)""",
+                     (event_id, member_name, score, signals, rank))
+        conn.commit()
+        conn.close()
+
+    def create_trade_report(self, event_id: int, member_name: str, asset: str, qty: float,
+                           sell_price: float, fees_usd: float):
+        gross = qty * sell_price
+        net = gross - fees_usd
+        share_model = COMMISSIONED_MEMBERS.get(member_name, 0.0)
+
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute("""INSERT INTO trade_reports 
+                    (event_id, member_name, asset, qty, sell_price, gross_usd, fees_usd, net_usd, share_model, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 (event_id, member_name, asset, qty, sell_price, gross, fees_usd, net, share_model, self._now()))
+        conn.commit()
+        conn.close()
+
+    def get_stats(self) -> str:
+        members = self.get_all_members()
+        if not members:
+            return "❌ Нет участников."
+
+        lines = ["📊 **СТАТИСТИКА**\n"]
+        for m in members:
+            refund = m["refund_days"]
+            gap = m["last_gap_days"]
+            refund_str = ", ".join(map(str, refund)) if refund else "—"
+            gap_str = f"{gap[0]}-{gap[1]}" if gap else "—"
+            lines.append(f"• **{m['name']}**: {m['ap']}AP | вернут [{refund_str}] | последний [{gap_str}]")
+        return "\n".join(lines)
+
+
+# ============================================================================
+# ПРИОРИТИЗАЦИЯ (SCORE)
+# ============================================================================
+
+def calculate_score(member: Dict, ap_threshold: int) -> Tuple[int, str]:
+    """
+    Возвращает (score, signals_text)
+    
+    +2 — если хотя бы одна дата возврата AP ≤ 3 дней
+    +1 — если AP ≥ (порог + 20)
+    +1 — если последний дроп ≥ 7 дней назад
+    """
+    score = 0
+    signals = []
+
+    # Проверка refund_days
+    refund_days = member.get("refund_days", [])
+    if refund_days and min(refund_days) <= 3:
+        score += 2
+        signals.append(f"refund≤3")
+
+    # Проверка AP
+    ap = member.get("ap", 0)
+    if ap >= ap_threshold + 20:
+        score += 1
+        signals.append(f"surplus≥20")
+
+    # Проверка last_gap
+    gap = member.get("last_gap_days", [0, 0])
+    if gap and gap[1] >= 7:
+        score += 1
+        signals.append(f"rest≥7")
+
+    signals_text = ", ".join(signals) if signals else "—"
+    return min(score, 4), signals_text
+
+
+def get_top_candidates(db: Database, ap_threshold: int, limit: int = 3) -> List[Dict]:
+    """Возвращает топ-N кандидатов по score"""
+    members = db.get_all_members()
+    
+    scored = []
+    for m in members:
+        score, signals = calculate_score(m, ap_threshold)
+        scored.append({
+            "name": m["name"],
+            "ap": m["ap"],
+            "refund_days": m["refund_days"],
+            "last_gap_days": m["last_gap_days"],
+            "score": score,
+            "signals": signals
+        })
+
+    # Сортировка: score (DESC) → AP (DESC) → min(refund_days) → max(last_gap)
+    scored.sort(key=lambda x: (
+        -x["score"],
+        -x["ap"],
+        min(x["refund_days"]) if x["refund_days"] else 999,
+        -max(x["last_gap_days"]) if x["last_gap_days"] else 0
+    ))
+
+    # Сохраняем в БД
+    recs = [(m["name"], m["score"], m["signals"], i + 1) for i, m in enumerate(scored[:limit])]
+    # db.save_recommendations(event_id, recs)  # если нужно
+
+    return scored[:limit]
+
+
+# ============================================================================
+# ПАРСЕР КОМАНД
+# ============================================================================
+
+def parse_drop_command(text: str) -> Optional[Dict]:
+    """
+    Парсит /drop Серёга 240AP вернут 3,5 последний 5-7
+    """
+    # Примерный паттерн: /drop <Имя> <AP> вернут <список> последний <диапазон>
+    pattern = r"/drop\s+(.+?)\s+(\d+)\s*AP\s+вернут\s+([\d,]+)\s+последний\s+(\d+)-(\d+)"
+    match = re.search(pattern, text)
+    
+    if not match:
+        return None
+
+    name = match.group(1).strip()
+    ap = int(match.group(2))
+    refund = [int(x.strip()) for x in match.group(3).split(",")]
+    gap_min = int(match.group(4))
+    gap_max = int(match.group(5))
+
+    return {
+        "name": name,
+        "ap": ap,
+        "refund_days": refund,
+        "last_gap": (gap_min, gap_max)
+    }
+
+
+def parse_newdrop_command(text: str) -> Optional[Dict]:
+    """
+    Парсит /newdrop завтра 14:00 порог 200 [CORL]
+    или /newdrop 16:30 порог 210 CORL
+    """
+    pattern = r"/newdrop\s+(?:(завтра|сегодня)\s+)?(\d{1,2}):(\d{2})\s+порог\s+(\d+)(?:\s+(.+))?$"
+    match = re.search(pattern, text)
+    
+    if not match:
+        return None
+
+    day_str = match.group(1) or "сегодня"
+    hour = int(match.group(2))
+    minute = int(match.group(3))
+    threshold = int(match.group(4))
+    symbol = match.group(5) or ""
+
+    now = datetime.now(TZ)
+    if day_str == "завтра":
+        target_date = now + timedelta(days=1)
+    else:
+        target_date = now
+
+    target_dt = target_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    when_ts = int(target_dt.timestamp())
+
+    return {
+        "when_ts": when_ts,
+        "ap_threshold": threshold,
+        "symbol": symbol.strip(),
+        "datetime": target_dt
+    }
+
+
+def parse_sold_command(text: str) -> Optional[Dict]:
+    """
+    Парсит /sold Серёга CORL 125шт по 0.80$ комса 2.5$
+    """
+    pattern = r"/sold\s+(.+?)\s+(\w+)\s+(\d+)\s*шт\s+по\s+([\d.]+)\s*\$?\s+комса\s+([\d.]+)\s*\$?"
+    match = re.search(pattern, text)
+    
+    if not match:
+        return None
+
+    name = match.group(1).strip()
+    asset = match.group(2).strip()
+    qty = int(match.group(3))
+    sell_price = float(match.group(4))
+    fees = float(match.group(5))
+
+    return {
+        "member_name": name,
+        "asset": asset,
+        "qty": qty,
+        "sell_price": sell_price,
+        "fees_usd": fees
+    }
+
+
+# ============================================================================
+# ИНТЕРФЕЙС БОТа (CLI)
+# ============================================================================
+
+class AlphaTrackerBot:
+    def __init__(self):
+        self.db = Database()
+        self.last_drop_event = None
+
+    def is_working_hours(self) -> bool:
+        now = datetime.now(TZ)
+        return WORK_START <= now.hour < WORK_END
+
+    def handle_command(self, text: str) -> str:
+        """Основной обработчик команд"""
+        
+        if not self.is_working_hours() and not text.startswith("/start") and not text.startswith("/stats"):
+            return f"😴 Бот отдыхает до {WORK_START}:00 ⏰"
+
+        text = text.strip()
+
+        if text == "/start":
+            return self.cmd_start()
+        elif text == "/stats":
+            return self.db.get_stats()
+        elif text.startswith("/drop"):
+            return self.cmd_drop(text)
+        elif text.startswith("/newdrop"):
+            return self.cmd_newdrop(text)
+        elif text.startswith("/sold"):
+            return self.cmd_sold(text)
+        elif text.startswith("/who"):
+            return self.cmd_who(text)
+        else:
+            return "❓ Неизвестная команда. Используй /start для справки."
+
+    def cmd_start(self) -> str:
+        return """🤖 **AlphaTrackerBot** — управление дропами
+
+**Основные команды:**
+• `/drop <Имя> <AP> вернут X,Y последний A-B` — обновить данные участника
+• `/newdrop [завтра|сегодня] HH:MM порог N [тикер]` — создать дроп
+• `/sold <Имя> <ASSET> QTYшт по PRICE$ комса FEE$` — отчёт о продаже
+• `/stats` — статистика по участникам
+• `/who порог N` — топ-3 кандидатов на порог N
+
+**Примеры:**
+/drop Серёга 240AP вернут 3,5 последний 5-7
+/newdrop завтра 14:00 порог 200 CORL
+/sold Серёга CORL 125шт по 0.80$ комса 2.5$
+/who порог 210
+
+🔗 Рабочие часы: 11:00–23:00 (Kyiv)
+"""
+
+    def cmd_drop(self, text: str) -> str:
+        parsed = parse_drop_command(text)
+        if not parsed:
+            return "❌ Неверный формат. Используй:\n/drop <Имя> <AP> вернут X,Y последний A-B"
+
+        name = parsed["name"]
+        ap = parsed["ap"]
+        refund = parsed["refund_days"]
+        gap = parsed["last_gap"]
+
+        self.db.update_member(name, ap, refund, gap)
+        
+        refund_str = ", ".join(map(str, refund))
+        gap_str = f"{gap[0]}-{gap[1]}"
+        return f"✅ {name}: {ap}AP | вернут [{refund_str}] | последний [{gap_str}]"
+
+    def cmd_newdrop(self, text: str) -> str:
+        parsed = parse_newdrop_command(text)
+        if not parsed:
+            return "❌ Неверный формат. Используй:\n/newdrop завтра 14:00 порог 200 [CORL]"
+
+        event_id = self.db.create_drop_event(
+            parsed["when_ts"],
+            parsed["ap_threshold"],
+            parsed["symbol"]
+        )
+        self.last_drop_event = event_id
+
+        # Получаем топ-3
+        top3 = get_top_candidates(self.db, parsed["ap_threshold"], limit=3)
+
+        dt_str = parsed["datetime"].strftime("%d.%m %H:%M")
+        result = f"💧 **Дроп {dt_str}** | Порог {parsed['ap_threshold']}AP"
+        if parsed["symbol"]:
+            result += f" | {parsed['symbol']}"
+        result += "\n"
+
+        result += f"✅ Лучше подходят:\n"
+        for i, cand in enumerate(top3, 1):
+            refund = cand["refund_days"]
+            gap = cand["last_gap_days"]
+            refund_str = ", ".join(map(str, refund)) if refund else "—"
+            gap_str = f"{gap[0]}-{gap[1]}" if gap else "—"
+            result += f"  {i}. **{cand['name']}** (score {cand['score']}) | {cand['ap']}AP | вернут [{refund_str}] | последний [{gap_str}]\n"
+
+        result += f"\n⏰ Напоминания: -4ч, -3ч, -2ч, -1ч\n"
+        result += f"(Дроп ID: {event_id})"
+        return result
+
+    def cmd_sold(self, text: str) -> str:
+        parsed = parse_sold_command(text)
+        if not parsed:
+            return "❌ Неверный формат. Используй:\n/sold <Имя> <ASSET> QTYшт по PRICE$ комса FEE$"
+
+        member_name = parsed["member_name"]
+        asset = parsed["asset"]
+        qty = parsed["qty"]
+        sell_price = parsed["sell_price"]
+        fees = parsed["fees_usd"]
+
+        gross = qty * sell_price
+        net = gross - fees
+
+        share_model = COMMISSIONED_MEMBERS.get(member_name, 0.0)
+        if share_model > 0:
+            member_payout = net * (1 - share_model)
+            team_commission = net * share_model
+            result = f"✅ **{member_name}** продал {qty} {asset} по ${sell_price}\n"
+            result += f"Gross: ${gross:.2f} | Net: ${net:.2f}\n"
+            result += f"🧑 Участнику: ${member_payout:.2f}\n"
+            result += f"👥 Команде (20%): ${team_commission:.2f}"
+        else:
+            result = f"✅ **{member_name}** продал {qty} {asset} по ${sell_price}\n"
+            result += f"Gross: ${gross:.2f} | Net: ${net:.2f}\n"
+            result += f"💰 Участнику: ${net:.2f} (без комиссии)"
+
+        # Сохраняем в БД
+        event_id = self.last_drop_event or 0
+        self.db.create_trade_report(event_id, member_name, asset, qty, sell_price, fees)
+
+        return result
+
+    def cmd_who(self, text: str) -> str:
+        """Быстрый топ-3 без создания дропа"""
+        pattern = r"/who\s+порог\s+(\d+)"
+        match = re.search(pattern, text)
+        if not match:
+            return "❌ Используй: /who порог N"
+
+        threshold = int(match.group(1))
+        top3 = get_top_candidates(self.db, threshold, limit=3)
+
+        result = f"🎯 **Топ-3 на порог {threshold}AP**\n"
+        for i, cand in enumerate(top3, 1):
+            refund_str = ", ".join(map(str, cand["refund_days"])) if cand["refund_days"] else "—"
+            gap_str = f"{cand['last_gap_days'][0]}-{cand['last_gap_days'][1]}" if cand["last_gap_days"] else "—"
+            result += f"{i}. **{cand['name']}** ({cand['score']}) | {cand['ap']}AP | [{refund_str}] | [{gap_str}]\n"
+
+        return result
+
+
+# ============================================================================
+# TELEGRAM BOT
+# ============================================================================
+
+import os
+from typing import Optional
+
+# 👇 СЮДА ВСТАВЬ ТОКЕН! Или задай переменную окружения BOT_TOKEN
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+
+# Если хочешь использовать Telegram, раскомментируй:
+# pip install pyTelegramBotAPI
+# import telebot
+# bot_tg = telebot.TeleBot(BOT_TOKEN)
+
+class TelegramBotAdapter:
+    """Адаптер для pyTelegramBotAPI"""
+    
+    def __init__(self, token: str):
+        try:
+            import telebot
+            self.bot = telebot.TeleBot(token)
+            self.tracker = AlphaTrackerBot()
+            self.is_connected = True
+            print(f"✅ Telegram бот подключен!")
+        except ImportError:
+            print("❌ Библиотека pyTelegramBotAPI не установлена.")
+            print("   Установи: pip install pyTelegramBotAPI")
+            self.is_connected = False
+        except Exception as e:
+            print(f"❌ Ошибка подключения: {e}")
+            self.is_connected = False
+
+    def setup_handlers(self):
+        """Регистрирует обработчики сообщений"""
+        if not self.is_connected:
+            return
+
+        @self.bot.message_handler(func=lambda message: True)
+        def handle_message(message):
+            text = message.text.strip()
+            response = self.tracker.handle_command(text)
+            self.bot.reply_to(message, response, parse_mode="Markdown")
+
+    def start_polling(self):
+        """Запускает polling"""
+        if not self.is_connected:
+            print("❌ Telegram адаптер не инициализирован.")
+            return
+
+        print("🚀 Telegram бот начал слушать сообщения...")
+        try:
+            self.bot.infinity_polling()
+        except KeyboardInterrupt:
+            print("\n👋 Бот остановлен")
+
+
+# ============================================================================
+# ГЛАВНОЕ МЕНЮ (CLI + Telegram)
+# ============================================================================
+
+def main():
+    print("🤖 AlphaTrackerBot v1.0\n")
+    
+    # Проверяем токен
+    if BOT_TOKEN == "7813840039:AAFquVUm1z_IXM60VJwWqftocUCFYGhHRYI":
+        print("⚠️  Токен Telegram не установлен!")
+        print("   Выбери режим:\n")
+        print("   1) CLI режим (консоль)")
+        print("   2) Telegram режим (нужен токен)\n")
+        
+        choice = input("Выбор (1 или 2): ").strip()
+        
+        if choice == "2":
+            print("\n📌 Для Telegram режима:\n")
+            print("   a) Получи токен у @BotFather в Telegram")
+            print("   b) Задай переменную окружения:")
+            print("      export BOT_TOKEN='твой_токен_здесь'")
+            print("   c) Или отредактируй строку 362 в коде:")
+            print("      BOT_TOKEN = 'твой_токен_здесь'\n")
+            return
+        
+        choice = "1"
+    else:
+        choice = input("CLI (1) или Telegram (2)? [1]: ").strip() or "1"
+
+    if choice == "2":
+        # Telegram режим
+        tg_bot = TelegramBotAdapter(BOT_TOKEN)
+        if tg_bot.is_connected:
+            tg_bot.setup_handlers()
+            tg_bot.start_polling()
+    else:
+        # CLI режим
+        bot = AlphaTrackerBot()
+        print("🤖 AlphaTrackerBot запущен (CLI режим)")
+        print("Введи команду или /start для справки. /exit для выхода.\n")
+
+        while True:
+            try:
+                user_input = input(">>> ").strip()
+                if user_input.lower() == "/exit":
+                    print("👋 До свидания!")
+                    break
+                if not user_input:
+                    continue
+
+                response = bot.handle_command(user_input)
+                print(f"\n{response}\n")
+            except KeyboardInterrupt:
+                print("\n👋 Выход...")
+                break
+            except Exception as e:
+                print(f"❌ Ошибка: {e}\n")
+
+
+if __name__ == "__main__":
+    main()
