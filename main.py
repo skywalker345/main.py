@@ -661,5 +661,4 @@ def main():
                 print(f"❌ Ошибка: {e}\n")
 
 
-if __name__ == "__main__":
-    main()
+
