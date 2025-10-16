@@ -28,8 +28,6 @@ logger = logging.getLogger(__name__)
 # ---------- ENV ----------
 DB_PATH = os.getenv("DB_PATH", "alpha_bot.db")
 TOKEN = os.getenv("7813840039:AAFquVUm1z_IXM60VJwWqftocUCFYGhHRYI")
-if not TOKEN:
-    raise RuntimeError("7813840039:AAFquVUm1z_IXM60VJwWqftocUCFYGhHRYI is required")
 
 DEFAULT_TZ = os.getenv("TZ_KYIV", "Europe/Kyiv")
 KYIV_TZ = pytz.timezone(DEFAULT_TZ)
