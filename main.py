@@ -612,11 +612,11 @@ def main():
     # Проверяем токен и окружение
     is_render = os.getenv("RENDER") == "true"
     
-    if BOT_TOKEN == "7813840039:AAFquVUm1z_IXM60VJwWqftocUCFYGhHRYI":
+    if BOT_TOKEN == "8119055455:AAEPbK-87b8nl4exRGC2SAXTL6QDWiXCBBc":
         print("❌ Ошибка: токен Telegram не установлен!")
         print("\n📌 Инструкция для Render:")
         print("   1. Перейди в Dashboard → Environment")
-        print("   2. Добавь переменную: BOT_TOKEN = твой_токен_от_BotFather")
+        print("   2. Добавь переменную: BOT_TOKEN = 8119055455:AAEPbK-87b8nl4exRGC2SAXTL6QDWiXCBBc")
         print("   3. Перезапусти сервис\n")
         print("📌 Для локального запуска:")
         print("   export BOT_TOKEN='123456:ABCDEFghijklmnop'")
