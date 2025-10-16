@@ -1,0 +1,31 @@
+services:
+  - type: worker
+    name: alpha-drop-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python alpha_bot.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: DB_PATH
+        value: /data/alpha_bot.db
+      - key: TZ_KYIV
+        value: Europe/Kyiv
+```
+
+**4. На Render.com:**
+- Создай новый сервис (New → Web Service)
+- Подключи GitHub репозиторий с кодом
+- Выбери язык: Python
+- Build command: `pip install -r requirements.txt`
+- Start command: `python alpha_bot.py`
+- Тип: Background Worker (не Web Service)
+
+**5. Переменные окружения (Environment):**
+Добавь в Settings → Environment:
+```
+TELEGRAM_TOKEN=123456789:ABCdefGHIjklmnoPQRstuvwxyz
+DB_PATH=/data/alpha_bot.db
+TZ_KYIV=Europe/Kyiv
+CHAT_ID=123456789 (опционально)
+THREAD_ID=123 (опционально)
